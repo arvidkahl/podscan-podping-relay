@@ -1,0 +1,40 @@
+[Unit]
+Description=PodPing Watcher for Podscan.fm
+Documentation=https://github.com/Podcastindex-org/podping
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=podping
+Group=podping
+WorkingDirectory=/opt/podping-watcher
+EnvironmentFile=/opt/podping-watcher/config.env
+
+# Use virtual environment Python
+ExecStart=/opt/podping-watcher/venv/bin/python /opt/podping-watcher/watcher.py
+
+# Restart configuration
+Restart=always
+RestartSec=10
+StartLimitInterval=300
+StartLimitBurst=5
+
+# Resource limits
+MemoryLimit=512M
+CPUQuota=50%
+
+# Security hardening
+PrivateTmp=yes
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/opt/podping-watcher
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=podping-watcher
+
+[Install]
+WantedBy=multi-user.target
