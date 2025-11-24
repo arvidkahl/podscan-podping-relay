@@ -320,8 +320,7 @@ class PodPingWatcher:
                     "opNames": ["custom_json"],
                     "raw_ops": False,
                     "threading": False,
-                    "max_batch_size": 50,
-                    "mode": "head"
+                    "max_batch_size": 50
                 }
                 
                 if start_block:
