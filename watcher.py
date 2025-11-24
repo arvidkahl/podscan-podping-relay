@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-PodPing Watcher for Podscan.fm - Fixed Version
-Production-ready with proper error handling
+PodPing Watcher for Podscan.fm - Production Fixed Version
+Handles datetime properly and connects reliably to Hive
 """
 
 import json
@@ -12,7 +12,6 @@ import sys
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Set, List, Dict, Any
-from collections import deque
 
 import beem
 from beem.account import Account
@@ -21,24 +20,37 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util import Retry
 
+# Load configuration with proper trimming
+def get_env(key, default):
+    """Get environment variable with whitespace trimming"""
+    value = os.environ.get(key, default)
+    if isinstance(value, str):
+        value = value.strip()
+    return value
+
 # Configuration from environment
-TARGET_URL = os.environ.get('TARGET_URL', 'http://localhost:8080/-/podping')
-HIVE_NODES = os.environ.get('HIVE_NODES', ','.join([
+TARGET_URL = get_env('TARGET_URL', 'http://localhost:8080/-/podping')
+LOOKBACK_MINUTES = int(get_env('LOOKBACK_MINUTES', '5'))
+BATCH_SIZE = int(get_env('BATCH_SIZE', '50'))
+BATCH_TIMEOUT = int(get_env('BATCH_TIMEOUT', '3'))
+DEDUPE_WINDOW = int(get_env('DEDUPE_WINDOW', '30'))
+LOG_LEVEL = get_env('LOG_LEVEL', 'INFO')
+
+# Hive nodes - use the most reliable ones
+HIVE_NODES = get_env('HIVE_NODES', ','.join([
     "https://api.deathwing.me",
     "https://hive-api.arcange.eu",
+    "https://rpc.ecency.com",
     "https://api.hive.blog",
-    "https://api.openhive.network",
     "https://hived.emre.sh",
-    "https://hive.roelandp.nl"
+    "https://api.openhive.network",
 ])).split(',')
-LOOKBACK_MINUTES = int(os.environ.get('LOOKBACK_MINUTES', '5'))
-BATCH_SIZE = int(os.environ.get('BATCH_SIZE', '50'))
-BATCH_TIMEOUT = int(os.environ.get('BATCH_TIMEOUT', '3'))
-DEDUPE_WINDOW = int(os.environ.get('DEDUPE_WINDOW', '30'))
-LOG_LEVEL = os.environ.get('LOG_LEVEL', 'INFO')
+
+# Clean up node URLs
+HIVE_NODES = [node.strip() for node in HIVE_NODES if node.strip()]
 
 # Constants
-WATCHED_OPERATION_IDS = ["podping", "pp_"]
+WATCHED_OPERATION_IDS = ["podping", "pp_", "pplt_"]
 
 # Logging configuration
 logging.basicConfig(
@@ -46,6 +58,15 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+# Log configuration at startup
+logger.info(f"Configuration loaded:")
+logger.info(f"  TARGET_URL: {TARGET_URL}")
+logger.info(f"  BATCH_SIZE: {BATCH_SIZE}")
+logger.info(f"  BATCH_TIMEOUT: {BATCH_TIMEOUT}s")
+logger.info(f"  DEDUPE_WINDOW: {DEDUPE_WINDOW}s")
+logger.info(f"  LOOKBACK_MINUTES: {LOOKBACK_MINUTES}")
+logger.info(f"  HIVE_NODES: {len(HIVE_NODES)} nodes configured")
 
 class PodPingWatcher:
     def __init__(self):
@@ -94,35 +115,18 @@ class PodPingWatcher:
         session.mount("https://", adapter)
         return session
         
-    def get_allowed_accounts(self, acc_name="podping") -> Set[str]:
+    def get_allowed_accounts(self) -> Set[str]:
         """Get list of accounts authorized to send podpings"""
-        try:
-            # Try multiple nodes until one works
-            for node in HIVE_NODES:
-                try:
-                    logger.debug(f"Trying node: {node}")
-                    h = beem.Hive(node=node)
-                    master_account = Account(acc_name, blockchain_instance=h)
-                    following = master_account.get_following()
-                    if following is not None:
-                        allowed = {acc["following"] for acc in following}
-                        logger.info(f"Loaded {len(allowed)} authorized accounts from {node}")
-                        return allowed
-                except Exception as e:
-                    logger.debug(f"Failed with node {node}: {e}")
-                    continue
-                    
-        except Exception as e:
-            logger.error(f"Error fetching allowed accounts: {e}")
-            
-        # Fallback to known accounts if all nodes fail
-        logger.warning("Using fallback account list")
+        # For now, use a comprehensive fallback list
+        # The follow_api issue is affecting all nodes
+        logger.info("Using fallback account list due to API issues")
         return {
             "podping", "podping.aaa", "podping.bbb", 
             "podping.ccc", "podping.ddd", "podping.eee",
             "podping.fff", "podping.ggg", "podping.hhh",
-            "podping-bbb", "podping-ccc", "podping-ddd",
-            "podping-eee", "podping-fff", "podping-ggg"
+            "hivehydra", "podstation", "podping-bbb",
+            "podping-ccc", "podping-ddd", "podping-eee",
+            "podping-fff", "podping-ggg"
         }
     
     def clean_old_urls(self):
@@ -162,16 +166,28 @@ class PodPingWatcher:
         try:
             json_data = json.loads(post_data.get("json", "{}"))
             
-            # Extract URLs - handle both formats
-            urls = json_data.get("urls", [])
-            if not isinstance(urls, list):
-                urls = [urls]
+            # Extract URLs - handle multiple formats
+            urls = []
             
-            # Also check for singular 'url' field
-            if not urls and "url" in json_data:
+            # Check for 'urls' field (array)
+            if "urls" in json_data:
+                url_data = json_data.get("urls", [])
+                if isinstance(url_data, list):
+                    urls.extend(url_data)
+                elif isinstance(url_data, str):
+                    urls.append(url_data)
+            
+            # Check for 'url' field (singular)
+            if "url" in json_data:
                 url = json_data.get("url")
-                if url:
-                    urls = [url]
+                if url and isinstance(url, str):
+                    urls.append(url)
+            
+            # Check for 'iris' field (legacy format)
+            if "iris" in json_data:
+                iris_data = json_data.get("iris", [])
+                if isinstance(iris_data, list):
+                    urls.extend(iris_data)
             
             if not urls:
                 return
@@ -222,7 +238,7 @@ class PodPingWatcher:
             )
             
             if response.status_code == 200:
-                logger.info(f"✓ Sent {batch_size} URLs")
+                logger.info(f"✓ Sent {batch_size} URLs to {TARGET_URL}")
                 self.stats['sent'] += batch_size
                 self.url_buffer = []
             else:
@@ -237,7 +253,6 @@ class PodPingWatcher:
         except requests.exceptions.RequestException as e:
             logger.error(f"✗ HTTP request failed: {e}")
             self.stats['errors'] += 1
-            # Keep some URLs for retry
             if len(self.url_buffer) > 100:
                 self.url_buffer = self.url_buffer[-100:]
         finally:
@@ -259,21 +274,18 @@ class PodPingWatcher:
     def get_start_block(self, blockchain, minutes_back):
         """Calculate starting block number from minutes back"""
         try:
-            # Get current block info
             info = blockchain.info()
             current_block = info['head_block_number']
             
-            # Hive produces a block every 3 seconds
-            # So 20 blocks per minute
+            # Hive produces a block every 3 seconds = 20 blocks per minute
             blocks_back = minutes_back * 20
-            start_block = current_block - blocks_back
+            start_block = max(1, current_block - blocks_back)
             
             logger.debug(f"Current block: {current_block}, Starting from block: {start_block}")
             return start_block
             
         except Exception as e:
             logger.error(f"Error calculating start block: {e}")
-            # Default to a recent block if we can't calculate
             return None
             
     def run(self):
@@ -284,12 +296,13 @@ class PodPingWatcher:
         logger.info(f"Dedupe window: {DEDUPE_WINDOW}s")
         
         allowed_accounts = self.get_allowed_accounts()
+        logger.info(f"Monitoring {len(allowed_accounts)} accounts")
         
-        # Connect to blockchain with retry and better node selection
+        # Connect to blockchain with retry
         blockchain = None
-        max_retries = len(HIVE_NODES)
+        connected_node = None
         
-        for attempt, node in enumerate(HIVE_NODES):
+        for node in HIVE_NODES:
             try:
                 logger.info(f"Attempting connection to: {node}")
                 hive = beem.Hive(node=node)
@@ -297,69 +310,88 @@ class PodPingWatcher:
                 
                 # Test the connection
                 info = blockchain.info()
-                logger.info(f"Connected to {node} at block {info['head_block_number']}")
+                logger.info(f"✓ Connected to {node} at block {info['head_block_number']}")
+                connected_node = node
                 break
                 
             except Exception as e:
-                logger.error(f"Failed to connect to {node}: {e}")
-                if attempt < max_retries - 1:
-                    time.sleep(2)
-                else:
-                    logger.error("All Hive nodes failed!")
-                    raise
+                logger.warning(f"Failed to connect to {node}: {e}")
+                continue
         
         if not blockchain:
             raise Exception("Could not connect to any Hive node")
         
-        # Calculate starting block instead of using datetime
+        # Calculate starting block
         start_block = self.get_start_block(blockchain, LOOKBACK_MINUTES)
         
-        logger.info(f"Starting from {LOOKBACK_MINUTES} minutes ago (block {start_block})")
+        if start_block:
+            logger.info(f"Starting from block {start_block} ({LOOKBACK_MINUTES} minutes ago)")
+        else:
+            logger.info("Starting from current block")
         
         last_stats_time = time.time()
+        reconnect_attempts = 0
+        max_reconnect_attempts = 5
         
-        try:
-            # Use block number for start parameter, not datetime
-            stream_params = {
-                "opNames": ["custom_json"],
-                "raw_ops": False,
-                "threading": False
-            }
-            
-            # Only add start if we have a valid block number
-            if start_block:
-                stream_params["start"] = start_block
-            
-            stream = blockchain.stream(**stream_params)
-            
-            for post in stream:
-                if not self.running:
-                    break
-                    
-                operation_id = post.get("id", "")
-                if operation_id in WATCHED_OPERATION_IDS or operation_id.startswith("pp_"):
-                    posting_auths = post.get("required_posting_auths", [])
-                    if posting_auths and posting_auths[0] in allowed_accounts:
-                        self.process_podping(post)
+        while self.running:
+            try:
+                # Set up stream parameters
+                stream_params = {
+                    "opNames": ["custom_json"],
+                    "raw_ops": False,
+                    "threading": False
+                }
+                
+                if start_block:
+                    stream_params["start"] = start_block
+                
+                stream = blockchain.stream(**stream_params)
+                reconnect_attempts = 0  # Reset on successful connection
+                
+                for post in stream:
+                    if not self.running:
+                        break
                         
-                # Periodic flush
-                if time.time() - self.last_flush_time > BATCH_TIMEOUT:
-                    self.flush_urls()
+                    operation_id = post.get("id", "")
+                    if operation_id in WATCHED_OPERATION_IDS or operation_id.startswith("pp"):
+                        posting_auths = post.get("required_posting_auths", [])
+                        if posting_auths and posting_auths[0] in allowed_accounts:
+                            self.process_podping(post)
+                            
+                    # Periodic flush
+                    if time.time() - self.last_flush_time > BATCH_TIMEOUT:
+                        self.flush_urls()
+                        
+                    # Log stats every 60 seconds
+                    if time.time() - last_stats_time > 60:
+                        self.log_stats()
+                        last_stats_time = time.time()
+                        
+            except Exception as e:
+                logger.error(f"Stream error: {e}")
+                reconnect_attempts += 1
+                
+                if reconnect_attempts >= max_reconnect_attempts:
+                    logger.error(f"Max reconnection attempts reached")
+                    raise
                     
-                # Log stats every 60 seconds
-                if time.time() - last_stats_time > 60:
-                    self.log_stats()
-                    last_stats_time = time.time()
-                    
-        except Exception as e:
-            logger.exception(f"Stream error: {e}")
-            raise
+                logger.info(f"Attempting to reconnect (attempt {reconnect_attempts}/{max_reconnect_attempts})")
+                time.sleep(5 * reconnect_attempts)
+                
+                # Try to reconnect
+                try:
+                    blockchain = Blockchain(mode="head", blockchain_instance=hive)
+                    start_block = None  # Start from current on reconnect
+                    logger.info("Reconnected successfully")
+                except Exception as re:
+                    logger.error(f"Reconnection failed: {re}")
+                    continue
                 
         logger.info("Watcher stopped")
 
 def main():
     """Main entry point with automatic restart"""
-    logger.info("PodPing Watcher v1.1 - Production")
+    logger.info("PodPing Watcher v1.2 - Production")
     
     while True:
         watcher = None
