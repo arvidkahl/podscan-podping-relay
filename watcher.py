@@ -327,9 +327,9 @@ class PodPingWatcher:
                     stream_params["start"] = start_block
                 
                 stream = blockchain.stream(**stream_params)
-                error_count = 0  # Reset on success
-                
+
                 for post in stream:
+                    error_count = 0  # Reset only after successful iteration
                     if not self.running:
                         break
                         
